@@ -1,0 +1,494 @@
+"""MCP tool implementations for Proton Mail via Bridge."""
+
+from __future__ import annotations
+
+import base64
+import datetime as dt
+from dataclasses import asdict
+from email import message_from_bytes
+from email.message import EmailMessage, Message
+from email.utils import make_msgid
+from typing import Any
+
+from proton_mcp import config
+from proton_mcp.accounts import AccountStore
+from proton_mcp.bridge import BridgeSession
+from proton_mcp.exceptions import (
+    AttachmentTooLarge,
+    MessageHandleStale,
+    MessageTooLarge,
+    OutboundTooLarge,
+    ProtonMcpError,
+)
+from proton_mcp.shaping.mail import (
+    MessageHandle,
+    encode_handle,
+    parse_handle,
+    shape_attachment_list,
+    shape_folder,
+    shape_message_full,
+    shape_message_summary,
+    truncate_body,
+)
+
+_store = AccountStore()
+
+
+def _session(account: str) -> BridgeSession:
+    return BridgeSession(_store.load(account))
+
+
+def list_accounts() -> list[dict[str, str]]:
+    return [asdict(a) for a in _store.list()]
+
+
+def mail_list_folders(account: str) -> list[dict[str, Any]]:
+    session = _session(account)
+    imap = session.imap()
+    try:
+        listed = imap.list_folders()
+        out: list[dict[str, Any]] = []
+        for flags, delimiter, name in listed:
+            name_bytes = name.encode("utf-8") if isinstance(name, str) else name
+            status = imap.folder_status(name, [b"MESSAGES", b"UNSEEN"])
+            out.append(
+                shape_folder(
+                    flags=flags,
+                    delimiter=delimiter,
+                    name=name_bytes,
+                    message_count=int(status.get(b"MESSAGES", 0)),
+                    unseen_count=int(status.get(b"UNSEEN", 0)),
+                )
+            )
+        return out
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+_DATE_FIELDS = {"since", "before"}
+_TEXT_FIELDS = {
+    "from": "FROM",
+    "to": "TO",
+    "cc": "CC",
+    "subject": "SUBJECT",
+    "text": "TEXT",
+}
+_FLAG_FIELDS = {
+    "seen": ("SEEN", "UNSEEN"),
+    "flagged": ("FLAGGED", "UNFLAGGED"),
+    "answered": ("ANSWERED", "UNANSWERED"),
+}
+
+
+def _build_search_criteria(query: dict[str, Any]) -> list[Any]:
+    """Translate {from, subject, since, seen, ...} into imapclient SEARCH args."""
+    if not query:
+        return ["ALL"]
+    criteria: list[Any] = []
+    for k, v in query.items():
+        if k in _TEXT_FIELDS and v:
+            criteria.extend([_TEXT_FIELDS[k], str(v)])
+        elif k in _DATE_FIELDS and v:
+            parsed = dt.date.fromisoformat(str(v))
+            criteria.extend([k.upper(), parsed.strftime("%d-%b-%Y")])
+        elif k in _FLAG_FIELDS:
+            on, off = _FLAG_FIELDS[k]
+            criteria.append(on if v else off)
+    if not criteria:
+        return ["ALL"]
+    return criteria
+
+
+def mail_search(
+    account: str,
+    query: dict[str, Any],
+    folder: str = "INBOX",
+    max_results: int = 20,
+) -> list[dict[str, Any]]:
+    session = _session(account)
+    imap = session.imap()
+    try:
+        select_info = imap.select_folder(folder, readonly=True)
+        uidvalidity = int(select_info[b"UIDVALIDITY"])
+        criteria = _build_search_criteria(query)
+        uids = imap.search(criteria)
+        uids_sorted = sorted(uids, reverse=True)[:max_results]
+        if not uids_sorted:
+            return []
+        fetched = imap.fetch(uids_sorted, [b"FLAGS", b"RFC822.HEADER"])
+
+        out: list[dict[str, Any]] = []
+        for uid in uids_sorted:
+            data = fetched.get(uid)
+            if data is None:
+                continue
+            header_bytes = data.get(b"RFC822.HEADER", b"")
+            msg = message_from_bytes(header_bytes)
+            handle = encode_handle(
+                MessageHandle(folder=folder, uidvalidity=uidvalidity, uid=uid)
+            )
+            out.append(
+                shape_message_summary(
+                    msg,
+                    handle=handle,
+                    folder=folder,
+                    flags=data.get(b"FLAGS", ()),
+                )
+            )
+        return out
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+def _fetch_full_message(imap: Any, handle_str: str) -> tuple[Message, dict[bytes, Any]]:
+    """Open the folder, validate UIDVALIDITY, precheck size, fetch RFC822.
+
+    The size precheck is a cheap metadata FETCH; it lets us refuse a 200 MB
+    email before the bytes hit the wire. Without it, MAX_MAIL_BODY_BYTES /
+    MAX_ATTACHMENT_BYTES only fire after we've already pulled the full
+    message into memory.
+    """
+    handle = parse_handle(handle_str)
+    select_info = imap.select_folder(handle.folder, readonly=True)
+    if int(select_info[b"UIDVALIDITY"]) != handle.uidvalidity:
+        raise MessageHandleStale(handle_str)
+
+    size_fetched = imap.fetch([handle.uid], [b"RFC822.SIZE"])
+    size_data = size_fetched.get(handle.uid)
+    if size_data is None:
+        raise MessageHandleStale(handle_str)
+    rfc822_size = int(size_data.get(b"RFC822.SIZE", 0))
+    if rfc822_size > config.MAX_INBOUND_BYTES:
+        raise MessageTooLarge(size=rfc822_size, cap=config.MAX_INBOUND_BYTES)
+
+    fetched = imap.fetch([handle.uid], [b"FLAGS", b"RFC822"])
+    data = fetched.get(handle.uid)
+    if data is None:
+        raise MessageHandleStale(handle_str)
+    msg = message_from_bytes(data[b"RFC822"])
+    return msg, data
+
+
+def mail_get_message(account: str, handle: str) -> dict[str, Any]:
+    session = _session(account)
+    imap = session.imap()
+    try:
+        msg, data = _fetch_full_message(imap, handle)
+        h = parse_handle(handle)
+        shaped = shape_message_full(
+            msg, handle=handle, folder=h.folder, flags=data.get(b"FLAGS", ())
+        )
+        shaped["body_text"] = truncate_body(
+            shaped["body_text"], cap=config.MAX_MAIL_BODY_BYTES
+        )
+        for att in shaped["attachments"]:
+            att.pop("_part_index", None)
+        return shaped
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+def mail_get_attachment(
+    account: str, handle: str, attachment_id: str
+) -> dict[str, Any]:
+    session = _session(account)
+    imap = session.imap()
+    try:
+        msg, _data = _fetch_full_message(imap, handle)
+        atts = shape_attachment_list(msg)
+        match = next(
+            (a for a in atts if a["attachment_id"] == attachment_id), None
+        )
+        if match is None:
+            raise ValueError(
+                f"attachment {attachment_id!r} not found on message {handle!r}"
+            )
+        if match["size"] > config.MAX_ATTACHMENT_BYTES:
+            raise AttachmentTooLarge(
+                size=match["size"], cap=config.MAX_ATTACHMENT_BYTES
+            )
+        target_index = match["_part_index"]
+        index = 0
+        payload = b""
+        for part in msg.walk():
+            if part.is_multipart():
+                continue
+            if not part.get_filename():
+                continue
+            index += 1
+            if index == target_index:
+                decoded = part.get_payload(decode=True)
+                if isinstance(decoded, bytes):
+                    payload = decoded
+                break
+        return {
+            "filename": match["filename"],
+            "mime": match["mime"],
+            "size": match["size"],
+            "content_b64": base64.b64encode(payload).decode("ascii"),
+        }
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+def _estimated_decoded_size(b64_str: str) -> int:
+    """Cheap estimate of the decoded byte length of a base64 string.
+
+    Doesn't actually decode; just uses the standard 4-chars-per-3-bytes
+    expansion. The estimate is exact for properly-padded inputs and
+    slightly conservative (over-estimates by up to 2 bytes) for
+    unpadded inputs — that's safe for a size precheck.
+    """
+    stripped = b64_str.strip()
+    n = len(stripped)
+    if n == 0:
+        return 0
+    padding = stripped[-2:].count("=")
+    return (n * 3) // 4 - padding
+
+
+def _build_outbound(
+    *,
+    sender: str,
+    to: str,
+    subject: str,
+    body: str,
+    cc: str | None,
+    bcc: str | None,
+    html: bool,
+    in_reply_to: str | None,
+    attachments: list[dict[str, Any]] | None,
+) -> EmailMessage:
+    # Precheck size from the base64-encoded inputs BEFORE we decode and
+    # build the full message. Without this, a 200 MB base64 payload
+    # would already be sitting in memory by the time we raise.
+    body_size = len(body.encode("utf-8"))
+    attachments = attachments or []
+    estimated_attachment_size = 0
+    for att in attachments:
+        per = _estimated_decoded_size(att["content_b64"])
+        if per > config.MAX_ATTACHMENT_BYTES:
+            raise AttachmentTooLarge(size=per, cap=config.MAX_ATTACHMENT_BYTES)
+        estimated_attachment_size += per
+    estimated_total = body_size + estimated_attachment_size
+    if estimated_total > config.MAX_OUTBOUND_BYTES:
+        raise OutboundTooLarge(
+            size=estimated_total, cap=config.MAX_OUTBOUND_BYTES
+        )
+
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = to
+    if cc:
+        msg["Cc"] = cc
+    if bcc:
+        msg["Bcc"] = bcc
+    msg["Subject"] = subject
+    msg["Message-ID"] = make_msgid()
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = in_reply_to
+
+    if html:
+        msg.set_content("This message contains HTML — please use an HTML client.")
+        msg.add_alternative(body, subtype="html")
+    else:
+        msg.set_content(body)
+
+    for att in attachments:
+        raw = base64.b64decode(att["content_b64"])
+        maintype, _, subtype = att["mime"].partition("/")
+        msg.add_attachment(
+            raw,
+            maintype=maintype or "application",
+            subtype=subtype or "octet-stream",
+            filename=att["filename"],
+        )
+
+    # Defense in depth: re-check the actual serialized size in case the
+    # estimate missed headers/MIME framing overhead.
+    total = len(bytes(msg))
+    if total > config.MAX_OUTBOUND_BYTES:
+        raise OutboundTooLarge(size=total, cap=config.MAX_OUTBOUND_BYTES)
+    return msg
+
+
+def mail_send(
+    account: str,
+    to: str,
+    subject: str,
+    body: str,
+    cc: str | None = None,
+    bcc: str | None = None,
+    html: bool = False,
+    in_reply_to: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, str]:
+    rec = _store.load(account)
+    msg = _build_outbound(
+        sender=rec.email,
+        to=to,
+        subject=subject,
+        body=body,
+        cc=cc,
+        bcc=bcc,
+        html=html,
+        in_reply_to=in_reply_to,
+        attachments=attachments,
+    )
+    smtp = BridgeSession(rec).smtp()
+    try:
+        smtp.send_message(msg)
+    finally:
+        try:
+            smtp.quit()
+        except Exception:
+            pass
+    return {"message_id": str(msg["Message-ID"])}
+
+
+def _find_special_folder(imap: Any, kind: str) -> str:
+    """Resolve a SPECIAL-USE folder (\\Drafts, \\Trash, ...) to its name."""
+    flag = f"\\{kind.capitalize()}".encode()
+    for flags, _delim, name in imap.list_folders():
+        if flag in flags:
+            return str(name) if isinstance(name, str) else name.decode("utf-8")
+    raise ValueError(f"no folder marked as {kind!r} on this account")
+
+
+def mail_create_draft(
+    account: str,
+    to: str,
+    subject: str,
+    body: str,
+    cc: str | None = None,
+    bcc: str | None = None,
+    html: bool = False,
+    in_reply_to: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, str]:
+    rec = _store.load(account)
+    msg = _build_outbound(
+        sender=rec.email,
+        to=to,
+        subject=subject,
+        body=body,
+        cc=cc,
+        bcc=bcc,
+        html=html,
+        in_reply_to=in_reply_to,
+        attachments=attachments,
+    )
+    session = BridgeSession(rec)
+    imap = session.imap()
+    try:
+        drafts = _find_special_folder(imap, "drafts")
+        imap.append(drafts, bytes(msg), [b"\\Draft"], None)
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+    return {"message_id": str(msg["Message-ID"])}
+
+
+def _open_for_write(imap: Any, handle_str: str) -> int:
+    """select_folder (writeable) and validate UIDVALIDITY; return uid."""
+    handle = parse_handle(handle_str)
+    select_info = imap.select_folder(handle.folder, readonly=False)
+    if int(select_info[b"UIDVALIDITY"]) != handle.uidvalidity:
+        raise MessageHandleStale(handle_str)
+    return handle.uid
+
+
+def mail_modify_flags(
+    account: str,
+    handle: str,
+    add_flags: list[str] | None = None,
+    remove_flags: list[str] | None = None,
+) -> dict[str, Any]:
+    session = _session(account)
+    imap = session.imap()
+    try:
+        uid = _open_for_write(imap, handle)
+        if add_flags:
+            imap.add_flags([uid], [f.encode("ascii") for f in add_flags])
+        if remove_flags:
+            imap.remove_flags([uid], [f.encode("ascii") for f in remove_flags])
+        current = imap.get_flags([uid]).get(uid, ())
+        return {
+            "handle": handle,
+            "flags": [f.decode("ascii", errors="replace") for f in current],
+        }
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+def _move_uid(imap: Any, uid: int, dest_folder: str) -> None:
+    """IMAP MOVE if advertised, else COPY + \\Deleted + UID EXPUNGE.
+
+    Plain EXPUNGE would purge *every* message in the folder currently
+    flagged \\Deleted — including messages the user marked manually or
+    that lingered from a prior failed move. UID EXPUNGE (RFC 4315 /
+    UIDPLUS) only removes the specified UIDs, so a non-MOVE server still
+    needs UIDPLUS for a safe fallback. If neither is available we refuse
+    rather than risk data loss.
+    """
+    if imap.has_capability("MOVE"):
+        imap.move([uid], dest_folder)
+        return
+    if not imap.has_capability("UIDPLUS"):
+        raise ProtonMcpError(
+            "server advertises neither MOVE nor UIDPLUS; cannot safely "
+            "move this message without risking deletion of unrelated "
+            "messages flagged \\Deleted in the same folder."
+        )
+    imap.copy([uid], dest_folder)
+    imap.add_flags([uid], [b"\\Deleted"])
+    imap.expunge(messages=[uid])
+
+
+def mail_move_message(
+    account: str, handle: str, dest_folder: str
+) -> dict[str, Any]:
+    session = _session(account)
+    imap = session.imap()
+    try:
+        uid = _open_for_write(imap, handle)
+        _move_uid(imap, uid, dest_folder)
+        return {"handle": handle, "moved_to": dest_folder}
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+def mail_trash(account: str, handle: str) -> dict[str, Any]:
+    session = _session(account)
+    imap = session.imap()
+    try:
+        uid = _open_for_write(imap, handle)
+        trash = _find_special_folder(imap, "trash")
+        _move_uid(imap, uid, trash)
+        return {"handle": handle, "moved_to": trash}
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
