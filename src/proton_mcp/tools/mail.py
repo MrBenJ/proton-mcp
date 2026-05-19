@@ -350,3 +350,79 @@ def mail_create_draft(
         except Exception:
             pass
     return {"message_id": str(msg["Message-ID"])}
+
+
+def _open_for_write(imap: Any, handle_str: str) -> int:
+    """select_folder (writeable) and validate UIDVALIDITY; return uid."""
+    handle = parse_handle(handle_str)
+    select_info = imap.select_folder(handle.folder, readonly=False)
+    if int(select_info[b"UIDVALIDITY"]) != handle.uidvalidity:
+        raise MessageHandleStale(handle_str)
+    return handle.uid
+
+
+def mail_modify_flags(
+    account: str,
+    handle: str,
+    add_flags: list[str] | None = None,
+    remove_flags: list[str] | None = None,
+) -> dict[str, Any]:
+    session = _session(account)
+    imap = session.imap()
+    try:
+        uid = _open_for_write(imap, handle)
+        if add_flags:
+            imap.add_flags([uid], [f.encode("ascii") for f in add_flags])
+        if remove_flags:
+            imap.remove_flags([uid], [f.encode("ascii") for f in remove_flags])
+        current = imap.get_flags([uid]).get(uid, ())
+        return {
+            "handle": handle,
+            "flags": [f.decode("ascii", errors="replace") for f in current],
+        }
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+def _move_uid(imap: Any, uid: int, dest_folder: str) -> None:
+    """IMAP MOVE if advertised, else COPY + \\Deleted + EXPUNGE."""
+    if imap.has_capability("MOVE"):
+        imap.move([uid], dest_folder)
+    else:
+        imap.copy([uid], dest_folder)
+        imap.add_flags([uid], [b"\\Deleted"])
+        imap.expunge()
+
+
+def mail_move_message(
+    account: str, handle: str, dest_folder: str
+) -> dict[str, Any]:
+    session = _session(account)
+    imap = session.imap()
+    try:
+        uid = _open_for_write(imap, handle)
+        _move_uid(imap, uid, dest_folder)
+        return {"handle": handle, "moved_to": dest_folder}
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+def mail_trash(account: str, handle: str) -> dict[str, Any]:
+    session = _session(account)
+    imap = session.imap()
+    try:
+        uid = _open_for_write(imap, handle)
+        trash = _find_special_folder(imap, "trash")
+        _move_uid(imap, uid, trash)
+        return {"handle": handle, "moved_to": trash}
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from proton_mcp.tools import mail as mail_tools
 from tests.conftest import write_account_file
@@ -423,3 +424,91 @@ def test_mail_create_draft_appends_to_drafts_folder(
     assert folder == "Drafts"
     assert b"draft body" in raw_bytes
     assert b"\\Draft" in flags
+
+
+def test_mail_modify_flags_adds_and_removes_seen(
+    tmp_config_dir: Path, mock_bridge: dict
+):
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    imap = mock_bridge["imap"]
+    imap.select_folder.return_value = {b"UIDVALIDITY": 1}
+    imap.get_flags.return_value = {42: (b"\\Seen", b"\\Flagged")}
+
+    result = mail_tools.mail_modify_flags(
+        account="work",
+        handle="INBOX:1:42",
+        add_flags=["\\Flagged"],
+        remove_flags=["\\Seen"],
+    )
+
+    imap.add_flags.assert_called_once_with([42], [b"\\Flagged"])
+    imap.remove_flags.assert_called_once_with([42], [b"\\Seen"])
+    assert "\\Flagged" in result["flags"]
+
+
+def test_mail_modify_flags_stale_handle_raises(
+    tmp_config_dir: Path, mock_bridge: dict
+):
+    import pytest
+
+    from proton_mcp.exceptions import MessageHandleStale
+
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    imap = mock_bridge["imap"]
+    imap.select_folder.return_value = {b"UIDVALIDITY": 9999}
+
+    with pytest.raises(MessageHandleStale):
+        mail_tools.mail_modify_flags(
+            account="work", handle="INBOX:1:42", add_flags=["\\Seen"]
+        )
+
+
+def test_mail_move_message_uses_move_when_advertised(
+    tmp_config_dir: Path, mock_bridge: dict
+):
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    imap = mock_bridge["imap"]
+    imap.select_folder.return_value = {b"UIDVALIDITY": 1}
+    imap.has_capability.return_value = True
+    imap.move = MagicMock()
+
+    result = mail_tools.mail_move_message(
+        account="work", handle="INBOX:1:42", dest_folder="Archive"
+    )
+
+    imap.move.assert_called_once_with([42], "Archive")
+    assert result["moved_to"] == "Archive"
+
+
+def test_mail_move_message_falls_back_to_copy_when_no_move_capability(
+    tmp_config_dir: Path, mock_bridge: dict
+):
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    imap = mock_bridge["imap"]
+    imap.select_folder.return_value = {b"UIDVALIDITY": 1}
+    imap.has_capability.return_value = False
+
+    mail_tools.mail_move_message(
+        account="work", handle="INBOX:1:42", dest_folder="Archive"
+    )
+
+    imap.copy.assert_called_once_with([42], "Archive")
+    imap.add_flags.assert_called_once_with([42], [b"\\Deleted"])
+    imap.expunge.assert_called_once()
+
+
+def test_mail_trash_moves_to_special_trash_folder(
+    tmp_config_dir: Path, mock_bridge: dict
+):
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    imap = mock_bridge["imap"]
+    imap.select_folder.return_value = {b"UIDVALIDITY": 1}
+    imap.has_capability.return_value = True
+    imap.list_folders.return_value = [
+        ((b"\\HasNoChildren",), b"/", "INBOX"),
+        ((b"\\Trash", b"\\HasNoChildren"), b"/", "Trash"),
+    ]
+
+    result = mail_tools.mail_trash(account="work", handle="INBOX:1:42")
+    imap.move.assert_called_once_with([42], "Trash")
+    assert result["moved_to"] == "Trash"
