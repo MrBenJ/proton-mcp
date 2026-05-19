@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -46,3 +47,48 @@ def write_account_file(
         )
     )
     return path
+
+
+@pytest.fixture
+def mock_bridge(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Patch BridgeSession used by proton_mcp.tools.mail.
+
+    Returns a dict with:
+        "imap":  MagicMock standing in for IMAPClient
+        "smtp":  MagicMock standing in for smtplib.SMTP
+        "calls": list of (label, "imap"|"smtp") to assert routing
+    """
+    import importlib
+
+    imap = MagicMock(name="IMAPClient")
+    smtp = MagicMock(name="SMTP")
+    calls: list[tuple[str, str]] = []
+
+    class FakeSession:
+        def __init__(self, record):
+            self._record = record
+
+        def imap(self):
+            calls.append((self._record.label, "imap"))
+            return imap
+
+        def smtp(self):
+            calls.append((self._record.label, "smtp"))
+            return smtp
+
+    try:
+        mod = importlib.import_module("proton_mcp.tools.mail")
+    except ImportError:
+        return {
+            "imap": imap,
+            "smtp": smtp,
+            "calls": calls,
+            "FakeSession": FakeSession,
+        }
+    monkeypatch.setattr(mod, "BridgeSession", FakeSession)
+    return {
+        "imap": imap,
+        "smtp": smtp,
+        "calls": calls,
+        "FakeSession": FakeSession,
+    }
