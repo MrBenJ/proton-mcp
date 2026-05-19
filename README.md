@@ -38,7 +38,7 @@ including the Bridge setup:
 Currently supported harnesses:
 
 - **Claude Desktop** — [`agents/install/claude-desktop.md`](agents/install/claude-desktop.md)
-- **Codex CLI** — coming in a follow-up.
+- **Codex CLI** — [`agents/install/codex.md`](agents/install/codex.md)
 
 For manual setup, see below.
 
