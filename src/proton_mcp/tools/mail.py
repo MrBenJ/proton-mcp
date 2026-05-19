@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 from dataclasses import asdict
 from email import message_from_bytes
+from email.message import Message
 from typing import Any
 
+from proton_mcp import config
 from proton_mcp.accounts import AccountStore
 from proton_mcp.bridge import BridgeSession
+from proton_mcp.exceptions import AttachmentTooLarge, MessageHandleStale
 from proton_mcp.shaping.mail import (
     MessageHandle,
     encode_handle,
+    parse_handle,
+    shape_attachment_list,
     shape_folder,
+    shape_message_full,
     shape_message_summary,
+    truncate_body,
 )
 
 _store = AccountStore()
@@ -124,6 +132,88 @@ def mail_search(
                 )
             )
         return out
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+def _fetch_full_message(imap: Any, handle_str: str) -> tuple[Message, dict[bytes, Any]]:
+    """Open the folder, validate UIDVALIDITY, return (parsed email, fetch_data)."""
+    handle = parse_handle(handle_str)
+    select_info = imap.select_folder(handle.folder, readonly=True)
+    if int(select_info[b"UIDVALIDITY"]) != handle.uidvalidity:
+        raise MessageHandleStale(handle_str)
+    fetched = imap.fetch([handle.uid], [b"FLAGS", b"RFC822"])
+    data = fetched.get(handle.uid)
+    if data is None:
+        raise MessageHandleStale(handle_str)
+    msg = message_from_bytes(data[b"RFC822"])
+    return msg, data
+
+
+def mail_get_message(account: str, handle: str) -> dict[str, Any]:
+    session = _session(account)
+    imap = session.imap()
+    try:
+        msg, data = _fetch_full_message(imap, handle)
+        h = parse_handle(handle)
+        shaped = shape_message_full(
+            msg, handle=handle, folder=h.folder, flags=data.get(b"FLAGS", ())
+        )
+        shaped["body_text"] = truncate_body(
+            shaped["body_text"], cap=config.MAX_MAIL_BODY_BYTES
+        )
+        for att in shaped["attachments"]:
+            att.pop("_part_index", None)
+        return shaped
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+def mail_get_attachment(
+    account: str, handle: str, attachment_id: str
+) -> dict[str, Any]:
+    session = _session(account)
+    imap = session.imap()
+    try:
+        msg, _data = _fetch_full_message(imap, handle)
+        atts = shape_attachment_list(msg)
+        match = next(
+            (a for a in atts if a["attachment_id"] == attachment_id), None
+        )
+        if match is None:
+            raise ValueError(
+                f"attachment {attachment_id!r} not found on message {handle!r}"
+            )
+        if match["size"] > config.MAX_ATTACHMENT_BYTES:
+            raise AttachmentTooLarge(
+                size=match["size"], cap=config.MAX_ATTACHMENT_BYTES
+            )
+        target_index = match["_part_index"]
+        index = 0
+        payload = b""
+        for part in msg.walk():
+            if part.is_multipart():
+                continue
+            if not part.get_filename():
+                continue
+            index += 1
+            if index == target_index:
+                decoded = part.get_payload(decode=True)
+                if isinstance(decoded, bytes):
+                    payload = decoded
+                break
+        return {
+            "filename": match["filename"],
+            "mime": match["mime"],
+            "size": match["size"],
+            "content_b64": base64.b64encode(payload).decode("ascii"),
+        }
     finally:
         try:
             imap.logout()

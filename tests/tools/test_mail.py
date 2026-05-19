@@ -134,3 +134,146 @@ def test_mail_search_empty_query_uses_imap_all(
 
     criteria = imap.search.call_args.args[0]
     assert criteria == ["ALL"]
+
+
+def test_mail_get_message_returns_shaped_full_message(
+    tmp_config_dir: Path, mock_bridge: dict
+):
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    imap = mock_bridge["imap"]
+    imap.select_folder.return_value = {b"UIDVALIDITY": 1700000001}
+
+    raw = (
+        b"From: alice@proton.me\r\n"
+        b"To: bob@example.com\r\n"
+        b"Subject: hello\r\n"
+        b"Date: Tue, 19 May 2026 12:00:00 +0000\r\n"
+        b"Message-ID: <42@proton>\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"\r\n"
+        b"PLAIN BODY"
+    )
+    imap.fetch.return_value = {42: {b"FLAGS": (b"\\Seen",), b"RFC822": raw}}
+
+    msg = mail_tools.mail_get_message(
+        account="work", handle="INBOX:1700000001:42"
+    )
+    assert msg["handle"] == "INBOX:1700000001:42"
+    assert msg["subject"] == "hello"
+    assert msg["body_text"] == "PLAIN BODY"
+    assert msg["attachments"] == []
+
+
+def test_mail_get_message_stale_handle_raises(
+    tmp_config_dir: Path, mock_bridge: dict
+):
+    import pytest
+
+    from proton_mcp.exceptions import MessageHandleStale
+
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    imap = mock_bridge["imap"]
+    imap.select_folder.return_value = {b"UIDVALIDITY": 9999}
+
+    with pytest.raises(MessageHandleStale) as excinfo:
+        mail_tools.mail_get_message(
+            account="work", handle="INBOX:1700000001:42"
+        )
+    assert "INBOX:1700000001:42" in str(excinfo.value)
+
+
+def test_mail_get_message_truncates_oversize_body(
+    tmp_config_dir: Path, mock_bridge: dict, monkeypatch
+):
+    from proton_mcp import config as cfg
+
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    monkeypatch.setattr(cfg, "MAX_MAIL_BODY_BYTES", 50)
+
+    imap = mock_bridge["imap"]
+    imap.select_folder.return_value = {b"UIDVALIDITY": 1}
+    big_body = "x" * 5000
+    raw = (
+        b"From: a@b\r\nTo: c@d\r\nSubject: big\r\n"
+        b"Date: \r\nMessage-ID: <1@p>\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        + big_body.encode()
+    )
+    imap.fetch.return_value = {1: {b"FLAGS": (), b"RFC822": raw}}
+
+    msg = mail_tools.mail_get_message(account="work", handle="INBOX:1:1")
+    assert "[...truncated:" in msg["body_text"]
+    assert "5000 bytes total" in msg["body_text"]
+
+
+def test_mail_get_attachment_returns_base64_content(
+    tmp_config_dir: Path, mock_bridge: dict
+):
+    import base64
+    from email.message import EmailMessage
+
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    imap = mock_bridge["imap"]
+    imap.select_folder.return_value = {b"UIDVALIDITY": 1}
+
+    msg = EmailMessage()
+    msg["From"] = "a@b"
+    msg["To"] = "c@d"
+    msg["Subject"] = "s"
+    msg["Date"] = "Tue, 19 May 2026 12:00:00 +0000"
+    msg["Message-ID"] = "<1@p>"
+    msg.set_content("body")
+    msg.add_attachment(
+        b"PDFCONTENT", maintype="application", subtype="pdf", filename="invoice.pdf"
+    )
+    raw_bytes = bytes(msg)
+    imap.fetch.return_value = {1: {b"FLAGS": (), b"RFC822": raw_bytes}}
+
+    listed = mail_tools.mail_get_message(account="work", handle="INBOX:1:1")
+    att_id = listed["attachments"][0]["attachment_id"]
+
+    payload = mail_tools.mail_get_attachment(
+        account="work", handle="INBOX:1:1", attachment_id=att_id
+    )
+    assert payload["filename"] == "invoice.pdf"
+    assert payload["mime"] == "application/pdf"
+    assert payload["size"] == len(b"PDFCONTENT")
+    assert base64.b64decode(payload["content_b64"]) == b"PDFCONTENT"
+
+
+def test_mail_get_attachment_oversize_raises(
+    tmp_config_dir: Path, mock_bridge: dict, monkeypatch
+):
+    from email.message import EmailMessage
+
+    import pytest
+
+    from proton_mcp import config as cfg
+    from proton_mcp.exceptions import AttachmentTooLarge
+
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    monkeypatch.setattr(cfg, "MAX_ATTACHMENT_BYTES", 5)
+
+    imap = mock_bridge["imap"]
+    imap.select_folder.return_value = {b"UIDVALIDITY": 1}
+
+    msg = EmailMessage()
+    msg["From"] = "a@b"
+    msg["To"] = "c@d"
+    msg["Subject"] = "s"
+    msg["Date"] = ""
+    msg["Message-ID"] = "<1@p>"
+    msg.set_content("body")
+    msg.add_attachment(
+        b"BIG" * 100, maintype="application", subtype="pdf", filename="big.pdf"
+    )
+    imap.fetch.return_value = {1: {b"FLAGS": (), b"RFC822": bytes(msg)}}
+
+    full = mail_tools.mail_get_message(account="work", handle="INBOX:1:1")
+    att_id = full["attachments"][0]["attachment_id"]
+    with pytest.raises(AttachmentTooLarge):
+        mail_tools.mail_get_attachment(
+            account="work", handle="INBOX:1:1", attachment_id=att_id
+        )
