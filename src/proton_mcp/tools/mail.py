@@ -17,6 +17,7 @@ from proton_mcp.exceptions import (
     AttachmentTooLarge,
     MessageHandleStale,
     OutboundTooLarge,
+    ProtonMcpError,
 )
 from proton_mcp.shaping.mail import (
     MessageHandle,
@@ -388,13 +389,27 @@ def mail_modify_flags(
 
 
 def _move_uid(imap: Any, uid: int, dest_folder: str) -> None:
-    """IMAP MOVE if advertised, else COPY + \\Deleted + EXPUNGE."""
+    """IMAP MOVE if advertised, else COPY + \\Deleted + UID EXPUNGE.
+
+    Plain EXPUNGE would purge *every* message in the folder currently
+    flagged \\Deleted — including messages the user marked manually or
+    that lingered from a prior failed move. UID EXPUNGE (RFC 4315 /
+    UIDPLUS) only removes the specified UIDs, so a non-MOVE server still
+    needs UIDPLUS for a safe fallback. If neither is available we refuse
+    rather than risk data loss.
+    """
     if imap.has_capability("MOVE"):
         imap.move([uid], dest_folder)
-    else:
-        imap.copy([uid], dest_folder)
-        imap.add_flags([uid], [b"\\Deleted"])
-        imap.expunge()
+        return
+    if not imap.has_capability("UIDPLUS"):
+        raise ProtonMcpError(
+            "server advertises neither MOVE nor UIDPLUS; cannot safely "
+            "move this message without risking deletion of unrelated "
+            "messages flagged \\Deleted in the same folder."
+        )
+    imap.copy([uid], dest_folder)
+    imap.add_flags([uid], [b"\\Deleted"])
+    imap.expunge(messages=[uid])
 
 
 def mail_move_message(

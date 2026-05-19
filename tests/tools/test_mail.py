@@ -469,7 +469,7 @@ def test_mail_move_message_uses_move_when_advertised(
     write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
     imap = mock_bridge["imap"]
     imap.select_folder.return_value = {b"UIDVALIDITY": 1}
-    imap.has_capability.return_value = True
+    imap.has_capability.side_effect = lambda cap: cap == "MOVE"
     imap.move = MagicMock()
 
     result = mail_tools.mail_move_message(
@@ -480,13 +480,18 @@ def test_mail_move_message_uses_move_when_advertised(
     assert result["moved_to"] == "Archive"
 
 
-def test_mail_move_message_falls_back_to_copy_when_no_move_capability(
+def test_mail_move_message_uses_uid_expunge_fallback_when_uidplus_available(
     tmp_config_dir: Path, mock_bridge: dict
 ):
+    """No MOVE capability but UIDPLUS present: COPY + \\Deleted + UID EXPUNGE.
+
+    Crucially the expunge must be scoped to the specific UID — a plain
+    EXPUNGE would purge any other \\Deleted messages in the folder.
+    """
     write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
     imap = mock_bridge["imap"]
     imap.select_folder.return_value = {b"UIDVALIDITY": 1}
-    imap.has_capability.return_value = False
+    imap.has_capability.side_effect = lambda cap: cap == "UIDPLUS"
 
     mail_tools.mail_move_message(
         account="work", handle="INBOX:1:42", dest_folder="Archive"
@@ -494,7 +499,28 @@ def test_mail_move_message_falls_back_to_copy_when_no_move_capability(
 
     imap.copy.assert_called_once_with([42], "Archive")
     imap.add_flags.assert_called_once_with([42], [b"\\Deleted"])
-    imap.expunge.assert_called_once()
+    imap.expunge.assert_called_once_with(messages=[42])
+
+
+def test_mail_move_message_refuses_when_no_move_and_no_uidplus(
+    tmp_config_dir: Path, mock_bridge: dict
+):
+    """Neither MOVE nor UIDPLUS — refuse rather than risk a broad EXPUNGE."""
+    import pytest
+
+    from proton_mcp.exceptions import ProtonMcpError
+
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    imap = mock_bridge["imap"]
+    imap.select_folder.return_value = {b"UIDVALIDITY": 1}
+    imap.has_capability.return_value = False
+
+    with pytest.raises(ProtonMcpError) as excinfo:
+        mail_tools.mail_move_message(
+            account="work", handle="INBOX:1:42", dest_folder="Archive"
+        )
+    assert "UIDPLUS" in str(excinfo.value)
+    imap.expunge.assert_not_called()
 
 
 def test_mail_trash_moves_to_special_trash_folder(
@@ -503,7 +529,7 @@ def test_mail_trash_moves_to_special_trash_folder(
     write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
     imap = mock_bridge["imap"]
     imap.select_folder.return_value = {b"UIDVALIDITY": 1}
-    imap.has_capability.return_value = True
+    imap.has_capability.side_effect = lambda cap: cap == "MOVE"
     imap.list_folders.return_value = [
         ((b"\\HasNoChildren",), b"/", "INBOX"),
         ((b"\\Trash", b"\\HasNoChildren"), b"/", "Trash"),
