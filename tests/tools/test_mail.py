@@ -277,3 +277,149 @@ def test_mail_get_attachment_oversize_raises(
         mail_tools.mail_get_attachment(
             account="work", handle="INBOX:1:1", attachment_id=att_id
         )
+
+
+def test_mail_send_submits_via_smtp_and_returns_message_id(
+    tmp_config_dir: Path, mock_bridge: dict
+):
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    smtp = mock_bridge["smtp"]
+
+    result = mail_tools.mail_send(
+        account="work",
+        to="bob@example.com",
+        subject="Hi Bob",
+        body="hello",
+    )
+
+    assert "message_id" in result
+    smtp.send_message.assert_called_once()
+    sent_msg = smtp.send_message.call_args.args[0]
+    assert sent_msg["To"] == "bob@example.com"
+    assert sent_msg["Subject"] == "Hi Bob"
+    assert sent_msg["From"] == "a@proton.me"
+    assert mock_bridge["calls"][-1] == ("work", "smtp")
+
+
+def test_mail_send_threading_headers(
+    tmp_config_dir: Path, mock_bridge: dict
+):
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    smtp = mock_bridge["smtp"]
+
+    mail_tools.mail_send(
+        account="work",
+        to="bob@example.com",
+        subject="Re: Hi",
+        body="reply",
+        in_reply_to="<orig@proton.me>",
+    )
+
+    sent_msg = smtp.send_message.call_args.args[0]
+    assert sent_msg["In-Reply-To"] == "<orig@proton.me>"
+    assert sent_msg["References"] == "<orig@proton.me>"
+
+
+def test_mail_send_html_body_attaches_alternative(
+    tmp_config_dir: Path, mock_bridge: dict
+):
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    smtp = mock_bridge["smtp"]
+
+    mail_tools.mail_send(
+        account="work",
+        to="bob@example.com",
+        subject="HTML",
+        body="<p>hello</p>",
+        html=True,
+    )
+
+    sent_msg = smtp.send_message.call_args.args[0]
+    assert sent_msg.is_multipart()
+    types = [p.get_content_type() for p in sent_msg.walk() if not p.is_multipart()]
+    assert "text/html" in types
+
+
+def test_mail_send_attachments_are_decoded_and_attached(
+    tmp_config_dir: Path, mock_bridge: dict
+):
+    import base64
+
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    smtp = mock_bridge["smtp"]
+
+    mail_tools.mail_send(
+        account="work",
+        to="bob@example.com",
+        subject="With file",
+        body="body",
+        attachments=[
+            {
+                "filename": "note.txt",
+                "mime": "text/plain",
+                "content_b64": base64.b64encode(b"file content").decode(),
+            }
+        ],
+    )
+
+    sent_msg = smtp.send_message.call_args.args[0]
+    attached = [
+        p for p in sent_msg.walk()
+        if not p.is_multipart() and p.get_filename() == "note.txt"
+    ]
+    assert len(attached) == 1
+    assert attached[0].get_payload(decode=True) == b"file content"
+
+
+def test_mail_send_rejects_oversize_message(
+    tmp_config_dir: Path, mock_bridge: dict, monkeypatch
+):
+    import base64
+
+    import pytest
+
+    from proton_mcp import config as cfg
+    from proton_mcp.exceptions import OutboundTooLarge
+
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    monkeypatch.setattr(cfg, "MAX_OUTBOUND_BYTES", 100)
+
+    with pytest.raises(OutboundTooLarge):
+        mail_tools.mail_send(
+            account="work",
+            to="bob@example.com",
+            subject="big",
+            body="x",
+            attachments=[
+                {
+                    "filename": "big.bin",
+                    "mime": "application/octet-stream",
+                    "content_b64": base64.b64encode(b"y" * 5000).decode(),
+                }
+            ],
+        )
+
+
+def test_mail_create_draft_appends_to_drafts_folder(
+    tmp_config_dir: Path, mock_bridge: dict
+):
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    imap = mock_bridge["imap"]
+    imap.list_folders.return_value = [
+        ((b"\\HasNoChildren",), b"/", "INBOX"),
+        ((b"\\Drafts", b"\\HasNoChildren"), b"/", "Drafts"),
+    ]
+
+    result = mail_tools.mail_create_draft(
+        account="work",
+        to="bob@example.com",
+        subject="draft",
+        body="draft body",
+    )
+
+    assert "message_id" in result
+    imap.append.assert_called_once()
+    folder, raw_bytes, flags, _date = imap.append.call_args.args
+    assert folder == "Drafts"
+    assert b"draft body" in raw_bytes
+    assert b"\\Draft" in flags

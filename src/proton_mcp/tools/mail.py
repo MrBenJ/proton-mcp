@@ -6,13 +6,18 @@ import base64
 import datetime as dt
 from dataclasses import asdict
 from email import message_from_bytes
-from email.message import Message
+from email.message import EmailMessage, Message
+from email.utils import make_msgid
 from typing import Any
 
 from proton_mcp import config
 from proton_mcp.accounts import AccountStore
 from proton_mcp.bridge import BridgeSession
-from proton_mcp.exceptions import AttachmentTooLarge, MessageHandleStale
+from proton_mcp.exceptions import (
+    AttachmentTooLarge,
+    MessageHandleStale,
+    OutboundTooLarge,
+)
 from proton_mcp.shaping.mail import (
     MessageHandle,
     encode_handle,
@@ -219,3 +224,129 @@ def mail_get_attachment(
             imap.logout()
         except Exception:
             pass
+
+
+def _build_outbound(
+    *,
+    sender: str,
+    to: str,
+    subject: str,
+    body: str,
+    cc: str | None,
+    bcc: str | None,
+    html: bool,
+    in_reply_to: str | None,
+    attachments: list[dict[str, Any]] | None,
+) -> EmailMessage:
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = to
+    if cc:
+        msg["Cc"] = cc
+    if bcc:
+        msg["Bcc"] = bcc
+    msg["Subject"] = subject
+    msg["Message-ID"] = make_msgid()
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = in_reply_to
+
+    if html:
+        msg.set_content("This message contains HTML — please use an HTML client.")
+        msg.add_alternative(body, subtype="html")
+    else:
+        msg.set_content(body)
+
+    for att in attachments or []:
+        raw = base64.b64decode(att["content_b64"])
+        maintype, _, subtype = att["mime"].partition("/")
+        msg.add_attachment(
+            raw,
+            maintype=maintype or "application",
+            subtype=subtype or "octet-stream",
+            filename=att["filename"],
+        )
+
+    total = len(bytes(msg))
+    if total > config.MAX_OUTBOUND_BYTES:
+        raise OutboundTooLarge(size=total, cap=config.MAX_OUTBOUND_BYTES)
+    return msg
+
+
+def mail_send(
+    account: str,
+    to: str,
+    subject: str,
+    body: str,
+    cc: str | None = None,
+    bcc: str | None = None,
+    html: bool = False,
+    in_reply_to: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, str]:
+    rec = _store.load(account)
+    msg = _build_outbound(
+        sender=rec.email,
+        to=to,
+        subject=subject,
+        body=body,
+        cc=cc,
+        bcc=bcc,
+        html=html,
+        in_reply_to=in_reply_to,
+        attachments=attachments,
+    )
+    smtp = BridgeSession(rec).smtp()
+    try:
+        smtp.send_message(msg)
+    finally:
+        try:
+            smtp.quit()
+        except Exception:
+            pass
+    return {"message_id": str(msg["Message-ID"])}
+
+
+def _find_special_folder(imap: Any, kind: str) -> str:
+    """Resolve a SPECIAL-USE folder (\\Drafts, \\Trash, ...) to its name."""
+    flag = f"\\{kind.capitalize()}".encode()
+    for flags, _delim, name in imap.list_folders():
+        if flag in flags:
+            return str(name) if isinstance(name, str) else name.decode("utf-8")
+    raise ValueError(f"no folder marked as {kind!r} on this account")
+
+
+def mail_create_draft(
+    account: str,
+    to: str,
+    subject: str,
+    body: str,
+    cc: str | None = None,
+    bcc: str | None = None,
+    html: bool = False,
+    in_reply_to: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, str]:
+    rec = _store.load(account)
+    msg = _build_outbound(
+        sender=rec.email,
+        to=to,
+        subject=subject,
+        body=body,
+        cc=cc,
+        bcc=bcc,
+        html=html,
+        in_reply_to=in_reply_to,
+        attachments=attachments,
+    )
+    session = BridgeSession(rec)
+    imap = session.imap()
+    try:
+        drafts = _find_special_folder(imap, "drafts")
+        imap.append(drafts, bytes(msg), [b"\\Draft"], None)
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+    return {"message_id": str(msg["Message-ID"])}
