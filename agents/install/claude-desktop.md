@@ -23,7 +23,7 @@ Detect what's already done so you can resume mid-flow on a rerun.
 
 ### Detection
 
-Run all six checks in parallel:
+Run all seven checks in parallel:
 
 ```bash
 # 1. Proton Bridge installed (macOS path; Windows/Linux differ)
@@ -42,10 +42,20 @@ command -v proton-mcp && command -v proton-mcp-auth
 # 5. At least one account configured
 find ~/.config/proton-mcp/accounts -maxdepth 1 -name '*.json' 2>/dev/null | head -1
 
-# 6. proton server already wired into Claude Desktop config
-jq -e '.mcpServers["proton"]' \
-  "$HOME/Library/Application Support/Claude/claude_desktop_config.json" \
-  2>/dev/null
+# 6. proton server already wired into Claude Desktop config (use Python — jq may not be installed)
+python3 -c "
+import json, os, sys
+cfg = os.path.expanduser('~/Library/Application Support/Claude/claude_desktop_config.json')
+try:
+    data = json.load(open(cfg))
+    entry = data.get('mcpServers', {}).get('proton')
+    print('configured:', json.dumps(entry)) if entry else sys.exit(1)
+except FileNotFoundError:
+    sys.exit(1)
+"
+
+# 7. jq available (optional — Phase 5 works without it, but note if missing)
+command -v jq || echo "jq not found — will use Python for config edits (safe)"
 ```
 
 ### User-facing template
@@ -58,6 +68,7 @@ jq -e '.mcpServers["proton"]' \
 > - [✓/✗] `proton-mcp` CLI installed
 > - [✓/✗] At least one Proton account connected
 > - [✓/✗] `proton` server wired into Claude Desktop
+> - [✓/–] `jq` installed (optional)
 >
 > I'll start at the earliest red phase. Sound good?"
 
@@ -243,17 +254,27 @@ jq -e '.bridge_password != null' ~/.config/proton-mcp/accounts/<label>.json >/de
 ### Detection
 
 ```bash
-jq -e '.mcpServers["proton"]' \
-  "$HOME/Library/Application Support/Claude/claude_desktop_config.json" \
-  2>/dev/null >/dev/null
+python3 -c "
+import json, os, sys
+cfg = os.path.expanduser('~/Library/Application Support/Claude/claude_desktop_config.json')
+try:
+    data = json.load(open(cfg))
+    entry = data.get('mcpServers', {}).get('proton')
+    print('configured:', json.dumps(entry)) if entry else sys.exit(1)
+except FileNotFoundError:
+    sys.exit(1)
+"
 ```
 
-If exit 0, verify the stored command exists:
+If exit 0, verify the stored command is executable:
 
 ```bash
-STORED_CMD="$(jq -r '.mcpServers["proton"].command' \
-  "$HOME/Library/Application Support/Claude/claude_desktop_config.json")"
-[ -x "$STORED_CMD" ]
+python3 -c "
+import json, os, sys
+cfg = os.path.expanduser('~/Library/Application Support/Claude/claude_desktop_config.json')
+cmd = json.load(open(cfg)).get('mcpServers', {}).get('proton', {}).get('command', '')
+sys.exit(0) if cmd and os.access(cmd, os.X_OK) else sys.exit(1)
+"
 ```
 
 If both pass, skip to Phase 6.
@@ -271,18 +292,30 @@ If both pass, skip to Phase 6.
 4. Set `.mcpServers["proton"] = {"command": "<PMCP_BIN>"}`. Preserve every other key.
 5. Write back with 2-space indent. Make a timestamped backup first.
 
-The `jq` one-liner:
+Use the Python one-liner (no `jq` required):
 
 ```bash
-CFG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
-PMCP_BIN="$(command -v proton-mcp)"
-[ -n "$PMCP_BIN" ] || { echo "proton-mcp not on PATH — rerun Phase 3 first."; exit 1; }
-mkdir -p "$(dirname "$CFG")"
-test -f "$CFG" || echo '{}' > "$CFG"
-cp "$CFG" "${CFG}.bak.$(date +%Y%m%d-%H%M%S)"
-TMP="$(mktemp)"
-jq --arg cmd "$PMCP_BIN" '.mcpServers["proton"] = {"command": $cmd}' "$CFG" > "$TMP" \
-  && mv "$TMP" "$CFG"
+python3 - <<'EOF'
+import json, os, shutil
+from datetime import datetime
+
+cfg = os.path.expanduser("~/Library/Application Support/Claude/claude_desktop_config.json")
+pmcp = os.popen("command -v proton-mcp").read().strip()
+if not pmcp:
+    raise SystemExit("proton-mcp not on PATH — rerun Phase 3 first.")
+
+os.makedirs(os.path.dirname(cfg), exist_ok=True)
+data = json.load(open(cfg)) if os.path.exists(cfg) else {}
+if os.path.exists(cfg):
+    backup = cfg + ".bak." + datetime.now().strftime("%Y%m%d-%H%M%S")
+    shutil.copy2(cfg, backup)
+    print(f"Backed up to {backup}")
+
+data.setdefault("mcpServers", {})["proton"] = {"command": pmcp}
+with open(cfg, "w") as f:
+    json.dump(data, f, indent=2)
+print(f"Done. proton-mcp binary: {pmcp}")
+EOF
 ```
 
 > **Why an absolute path?** Claude Desktop launched from Finder/Dock inherits launchd's minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), not your shell's. `uv tool install` places binaries in `~/.local/bin/`, which is on your shell PATH but not on the GUI's. The bare command `"proton-mcp"` works in a terminal but fails when Claude Desktop launches it.
@@ -294,9 +327,12 @@ jq --arg cmd "$PMCP_BIN" '.mcpServers["proton"] = {"command": $cmd}' "$CFG" > "$
 ### Verification
 
 ```bash
-STORED_CMD="$(jq -r '.mcpServers["proton"].command' \
-  "$HOME/Library/Application Support/Claude/claude_desktop_config.json")"
-[ -n "$STORED_CMD" ] && [ -x "$STORED_CMD" ]
+python3 -c "
+import json, os, sys
+cfg = os.path.expanduser('~/Library/Application Support/Claude/claude_desktop_config.json')
+cmd = json.load(open(cfg)).get('mcpServers', {}).get('proton', {}).get('command', '')
+print('ok:', cmd) if cmd and os.access(cmd, os.X_OK) else sys.exit('not configured or binary missing')
+"
 ```
 
 ---
@@ -327,8 +363,11 @@ STORED_CMD="$(jq -r '.mcpServers["proton"].command' \
    Should print nothing and wait on stdin (Ctrl-C to exit). If it errors, surface the message — likely a credentials issue.
 3. Verify config:
    ```bash
-   jq '.mcpServers["proton"]' \
-     "$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+   python3 -c "
+   import json, os
+   cfg = os.path.expanduser('~/Library/Application Support/Claude/claude_desktop_config.json')
+   print(json.dumps(json.load(open(cfg)).get('mcpServers', {}).get('proton'), indent=2))
+   "
    ```
 4. Check Claude Desktop's logs (Help → View Logs) for a startup error.
 

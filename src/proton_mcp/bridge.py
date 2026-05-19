@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import imaplib
 import smtplib
 import socket
 import ssl
@@ -56,25 +57,41 @@ class BridgeSession:
     def imap(self) -> IMAPClient:
         """Return a logged-in IMAPClient connected to Bridge.
 
-        Maps network failure → BridgeNotRunning, TLS mismatch →
-        BridgeTLSMismatch, auth failure → BridgeRejectedCredentials.
+        Tries implicit TLS (ssl=True) first; if the TLS handshake fails
+        (Bridge configured for STARTTLS), falls back to plaintext +
+        STARTTLS upgrade. Maps network failure → BridgeNotRunning, TLS
+        mismatch → BridgeTLSMismatch, auth failure →
+        BridgeRejectedCredentials.
         """
         rec = self._record
+        ctx = pinned_ssl_context(expected_fingerprint=rec.tls_fingerprint_sha256)
+
+        # --- implicit TLS (Bridge SSL/TLS mode) ---
         try:
             client = IMAPClient(
                 host=rec.imap_host,
                 port=rec.imap_port,
                 ssl=True,
-                ssl_context=pinned_ssl_context(
-                    expected_fingerprint=rec.tls_fingerprint_sha256
-                ),
+                ssl_context=ctx,
                 timeout=10,
             )
+            peer_der = client._sock.getpeercert(binary_form=True)
+        except ssl.SSLError:
+            # --- STARTTLS fallback (Bridge STARTTLS mode) ---
+            try:
+                client = IMAPClient(
+                    host=rec.imap_host,
+                    port=rec.imap_port,
+                    ssl=False,
+                    timeout=10,
+                )
+                client.starttls(ssl_context=ctx)
+            except (ConnectionRefusedError, TimeoutError, OSError) as e:
+                raise BridgeNotRunning(rec.imap_host, rec.imap_port) from e
+            peer_der = client._imap.socket().getpeercert(binary_form=True)
         except (ConnectionRefusedError, TimeoutError, OSError) as e:
-            # OSError covers ENETUNREACH, EHOSTUNREACH, etc.
             raise BridgeNotRunning(rec.imap_host, rec.imap_port) from e
 
-        peer_der = client._sock.getpeercert(binary_form=True)
         if peer_der is None or fingerprint_sha256(peer_der) != rec.tls_fingerprint_sha256:
             raise BridgeTLSMismatch(rec.label)
 
@@ -119,15 +136,36 @@ def probe_fingerprint(host: str, port: int, *, timeout: float = 10.0) -> str:
     """One-shot TLS handshake to <host>:<port>, return server cert SHA-256.
 
     Used by the auth CLI on `add` to display the Bridge fingerprint for
-    user TOFU confirmation. Bridge's IMAP listener speaks implicit TLS on
-    the configured port; the SMTP cert is the same identity.
+    user TOFU confirmation. Tries implicit TLS first (Bridge SSL/TLS mode);
+    falls back to STARTTLS via imaplib if the direct wrap fails (Bridge
+    STARTTLS mode). The SMTP cert is the same identity as IMAP.
     """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        with ctx.wrap_socket(sock, server_hostname=host) as tls:
-            der = tls.getpeercert(binary_form=True)
+
+    # Try implicit TLS first
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as tls:
+                der = tls.getpeercert(binary_form=True)
+        if der is None:
+            raise BridgeNotRunning(host, port)
+        return fingerprint_sha256(der)
+    except ssl.SSLError:
+        pass
+
+    # Fall back to STARTTLS (Bridge STARTTLS connection mode)
+    try:
+        conn = imaplib.IMAP4(host, port)
+        conn.starttls(ssl_context=ctx)
+        der = conn.socket().getpeercert(binary_form=True)
+        try:
+            conn.logout()
+        except Exception:
+            pass
+    except (ConnectionRefusedError, TimeoutError, OSError) as e:
+        raise BridgeNotRunning(host, port) from e
     if der is None:
         raise BridgeNotRunning(host, port)
     return fingerprint_sha256(der)
