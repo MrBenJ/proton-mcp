@@ -438,6 +438,48 @@ def test_mail_send_rejects_oversize_message(
         )
 
 
+def test_mail_send_rejects_oversize_attachment_before_decoding(
+    tmp_config_dir: Path, mock_bridge: dict, monkeypatch
+):
+    """The attachment cap must fire BEFORE base64.b64decode allocates the
+    full payload. We monkeypatch base64.b64decode to raise if called, so
+    the test only passes if the precheck refuses the message first."""
+    import base64
+    from unittest.mock import patch
+
+    import pytest
+
+    from proton_mcp import config as cfg
+    from proton_mcp.exceptions import AttachmentTooLarge
+
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    monkeypatch.setattr(cfg, "MAX_ATTACHMENT_BYTES", 100)
+
+    # Build a b64 payload that decodes to ~5000 bytes — that's the input
+    # the caller would send.
+    huge_b64 = base64.b64encode(b"y" * 5000).decode()
+
+    with patch(
+        "proton_mcp.tools.mail.base64.b64decode",
+        side_effect=AssertionError("b64decode called before size precheck"),
+    ):
+        with pytest.raises(AttachmentTooLarge) as excinfo:
+            mail_tools.mail_send(
+                account="work",
+                to="bob@example.com",
+                subject="big",
+                body="x",
+                attachments=[
+                    {
+                        "filename": "big.bin",
+                        "mime": "application/octet-stream",
+                        "content_b64": huge_b64,
+                    }
+                ],
+            )
+    assert excinfo.value.cap == 100
+
+
 def test_mail_create_draft_appends_to_drafts_folder(
     tmp_config_dir: Path, mock_bridge: dict
 ):

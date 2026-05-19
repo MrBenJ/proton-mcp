@@ -243,6 +243,22 @@ def mail_get_attachment(
             pass
 
 
+def _estimated_decoded_size(b64_str: str) -> int:
+    """Cheap estimate of the decoded byte length of a base64 string.
+
+    Doesn't actually decode; just uses the standard 4-chars-per-3-bytes
+    expansion. The estimate is exact for properly-padded inputs and
+    slightly conservative (over-estimates by up to 2 bytes) for
+    unpadded inputs — that's safe for a size precheck.
+    """
+    stripped = b64_str.strip()
+    n = len(stripped)
+    if n == 0:
+        return 0
+    padding = stripped[-2:].count("=")
+    return (n * 3) // 4 - padding
+
+
 def _build_outbound(
     *,
     sender: str,
@@ -255,6 +271,23 @@ def _build_outbound(
     in_reply_to: str | None,
     attachments: list[dict[str, Any]] | None,
 ) -> EmailMessage:
+    # Precheck size from the base64-encoded inputs BEFORE we decode and
+    # build the full message. Without this, a 200 MB base64 payload
+    # would already be sitting in memory by the time we raise.
+    body_size = len(body.encode("utf-8"))
+    attachments = attachments or []
+    estimated_attachment_size = 0
+    for att in attachments:
+        per = _estimated_decoded_size(att["content_b64"])
+        if per > config.MAX_ATTACHMENT_BYTES:
+            raise AttachmentTooLarge(size=per, cap=config.MAX_ATTACHMENT_BYTES)
+        estimated_attachment_size += per
+    estimated_total = body_size + estimated_attachment_size
+    if estimated_total > config.MAX_OUTBOUND_BYTES:
+        raise OutboundTooLarge(
+            size=estimated_total, cap=config.MAX_OUTBOUND_BYTES
+        )
+
     msg = EmailMessage()
     msg["From"] = sender
     msg["To"] = to
@@ -274,7 +307,7 @@ def _build_outbound(
     else:
         msg.set_content(body)
 
-    for att in attachments or []:
+    for att in attachments:
         raw = base64.b64decode(att["content_b64"])
         maintype, _, subtype = att["mime"].partition("/")
         msg.add_attachment(
@@ -284,6 +317,8 @@ def _build_outbound(
             filename=att["filename"],
         )
 
+    # Defense in depth: re-check the actual serialized size in case the
+    # estimate missed headers/MIME framing overhead.
     total = len(bytes(msg))
     if total > config.MAX_OUTBOUND_BYTES:
         raise OutboundTooLarge(size=total, cap=config.MAX_OUTBOUND_BYTES)
