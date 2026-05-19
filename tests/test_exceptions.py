@@ -8,6 +8,7 @@ from proton_mcp.exceptions import (
     BridgeTLSMismatch,
     InvalidAccountLabel,
     MessageHandleStale,
+    MessageTooLarge,
     OutboundTooLarge,
     ProtonMcpError,
 )
@@ -22,9 +23,18 @@ def test_all_errors_inherit_from_base():
         BridgeRejectedCredentials,
         MessageHandleStale,
         AttachmentTooLarge,
+        MessageTooLarge,
         OutboundTooLarge,
     ):
         assert issubclass(cls, ProtonMcpError)
+
+
+def test_message_too_large_includes_byte_counts():
+    err = MessageTooLarge(size=50_000_000, cap=26_214_400)
+    assert "50000000" in str(err)
+    assert "26214400" in str(err)
+    assert err.size == 50_000_000
+    assert err.cap == 26_214_400
 
 
 def test_account_not_configured_message_includes_label_and_command():

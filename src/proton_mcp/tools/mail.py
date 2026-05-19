@@ -16,6 +16,7 @@ from proton_mcp.bridge import BridgeSession
 from proton_mcp.exceptions import (
     AttachmentTooLarge,
     MessageHandleStale,
+    MessageTooLarge,
     OutboundTooLarge,
     ProtonMcpError,
 )
@@ -146,11 +147,26 @@ def mail_search(
 
 
 def _fetch_full_message(imap: Any, handle_str: str) -> tuple[Message, dict[bytes, Any]]:
-    """Open the folder, validate UIDVALIDITY, return (parsed email, fetch_data)."""
+    """Open the folder, validate UIDVALIDITY, precheck size, fetch RFC822.
+
+    The size precheck is a cheap metadata FETCH; it lets us refuse a 200 MB
+    email before the bytes hit the wire. Without it, MAX_MAIL_BODY_BYTES /
+    MAX_ATTACHMENT_BYTES only fire after we've already pulled the full
+    message into memory.
+    """
     handle = parse_handle(handle_str)
     select_info = imap.select_folder(handle.folder, readonly=True)
     if int(select_info[b"UIDVALIDITY"]) != handle.uidvalidity:
         raise MessageHandleStale(handle_str)
+
+    size_fetched = imap.fetch([handle.uid], [b"RFC822.SIZE"])
+    size_data = size_fetched.get(handle.uid)
+    if size_data is None:
+        raise MessageHandleStale(handle_str)
+    rfc822_size = int(size_data.get(b"RFC822.SIZE", 0))
+    if rfc822_size > config.MAX_INBOUND_BYTES:
+        raise MessageTooLarge(size=rfc822_size, cap=config.MAX_INBOUND_BYTES)
+
     fetched = imap.fetch([handle.uid], [b"FLAGS", b"RFC822"])
     data = fetched.get(handle.uid)
     if data is None:

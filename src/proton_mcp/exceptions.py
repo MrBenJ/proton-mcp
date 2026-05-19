@@ -64,6 +64,17 @@ class MessageHandleStale(ProtonMcpError):
         self.handle = handle
 
 
+class MessageTooLarge(ProtonMcpError):
+    """Inbound RFC822.SIZE exceeded the cap before we pulled the bytes."""
+
+    def __init__(self, *, size: int, cap: int) -> None:
+        super().__init__(
+            f"Message too large: {size} bytes exceeds inbound cap of {cap} bytes."
+        )
+        self.size = size
+        self.cap = cap
+
+
 class AttachmentTooLarge(ProtonMcpError):
     def __init__(self, *, size: int, cap: int) -> None:
         super().__init__(

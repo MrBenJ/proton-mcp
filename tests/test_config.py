@@ -24,3 +24,4 @@ def test_size_caps_match_spec():
     assert config.MAX_MAIL_BODY_BYTES == 256 * 1024
     assert config.MAX_ATTACHMENT_BYTES == 10 * 1024 * 1024
     assert config.MAX_OUTBOUND_BYTES == 25 * 1024 * 1024
+    assert config.MAX_INBOUND_BYTES == 25 * 1024 * 1024

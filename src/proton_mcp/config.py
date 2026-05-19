@@ -25,3 +25,8 @@ MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 
 # Hard cap on total outbound message size. Proton's SMTP allows 25 MiB.
 MAX_OUTBOUND_BYTES = 25 * 1024 * 1024
+
+# Hard cap on total inbound message size (RFC822.SIZE). Checked BEFORE
+# we pull the bytes off the wire so a 200 MB email can't OOM us or hang
+# the stdio transport. 25 MiB mirrors the outbound cap.
+MAX_INBOUND_BYTES = 25 * 1024 * 1024

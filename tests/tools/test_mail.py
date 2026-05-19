@@ -155,7 +155,10 @@ def test_mail_get_message_returns_shaped_full_message(
         b"\r\n"
         b"PLAIN BODY"
     )
-    imap.fetch.return_value = {42: {b"FLAGS": (b"\\Seen",), b"RFC822": raw}}
+    imap.fetch.side_effect = [
+        {42: {b"RFC822.SIZE": len(raw)}},
+        {42: {b"FLAGS": (b"\\Seen",), b"RFC822": raw}},
+    ]
 
     msg = mail_tools.mail_get_message(
         account="work", handle="INBOX:1700000001:42"
@@ -164,6 +167,37 @@ def test_mail_get_message_returns_shaped_full_message(
     assert msg["subject"] == "hello"
     assert msg["body_text"] == "PLAIN BODY"
     assert msg["attachments"] == []
+
+
+def test_mail_get_message_refuses_when_rfc822_size_exceeds_inbound_cap(
+    tmp_config_dir: Path, mock_bridge: dict, monkeypatch
+):
+    """The size precheck must run BEFORE the full RFC822 fetch.
+
+    Mocks `fetch` so the first call returns RFC822.SIZE and the second
+    would raise — verifying we never make the second call when the
+    precheck rejects.
+    """
+    import pytest
+
+    from proton_mcp import config as cfg
+    from proton_mcp.exceptions import MessageTooLarge
+
+    write_account_file(tmp_config_dir / "accounts", "work", "a@proton.me")
+    monkeypatch.setattr(cfg, "MAX_INBOUND_BYTES", 1024)
+
+    imap = mock_bridge["imap"]
+    imap.select_folder.return_value = {b"UIDVALIDITY": 1}
+    imap.fetch.side_effect = [
+        {1: {b"RFC822.SIZE": 5_000_000}},
+        AssertionError("full RFC822 fetched despite oversize precheck"),
+    ]
+
+    with pytest.raises(MessageTooLarge) as excinfo:
+        mail_tools.mail_get_message(account="work", handle="INBOX:1:1")
+    assert excinfo.value.size == 5_000_000
+    assert excinfo.value.cap == 1024
+    assert imap.fetch.call_count == 1
 
 
 def test_mail_get_message_stale_handle_raises(
@@ -202,7 +236,10 @@ def test_mail_get_message_truncates_oversize_body(
         b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
         + big_body.encode()
     )
-    imap.fetch.return_value = {1: {b"FLAGS": (), b"RFC822": raw}}
+    imap.fetch.side_effect = [
+        {1: {b"RFC822.SIZE": len(raw)}},
+        {1: {b"FLAGS": (), b"RFC822": raw}},
+    ]
 
     msg = mail_tools.mail_get_message(account="work", handle="INBOX:1:1")
     assert "[...truncated:" in msg["body_text"]
