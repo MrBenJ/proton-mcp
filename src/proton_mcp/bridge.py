@@ -159,7 +159,13 @@ def probe_fingerprint(host: str, port: int, *, timeout: float = 10.0) -> str:
     try:
         conn = imaplib.IMAP4(host, port)
         conn.starttls(ssl_context=ctx)
-        der = conn.socket().getpeercert(binary_form=True)
+        # imaplib.IMAP4.socket() is typed as socket.socket, but after
+        # starttls() it's actually an ssl.SSLSocket. Narrow via getattr
+        # — same pattern as BridgeSession.smtp().
+        get_cert = getattr(conn.socket(), "getpeercert", None)
+        if get_cert is None:
+            raise BridgeNotRunning(host, port)
+        der = get_cert(True)
         try:
             conn.logout()
         except Exception:
